@@ -4,7 +4,7 @@ import traceback
 from datetime import datetime
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -97,6 +97,48 @@ async def chat(request: MessageRequest, authorization: Optional[str] = Header(No
         }).execute()
 
         return {"reply": reply, "session_id": session_id}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── Voice Mode: Speech-to-Text ────────────────────────────────────────────
+# Receives a recorded utterance (webm/opus from MediaRecorder) and transcribes
+# it via Gemini 2.5 Flash Lite. Auth-gated the same way as /chat. No audio is
+# ever persisted server-side — it's transcribed in-memory and discarded.
+@app.post("/voice/stt")
+async def voice_stt(audio: UploadFile = File(...), authorization: Optional[str] = Header(None)):
+    user_id = get_user_from_token(authorization)  # noqa: F841 (kept for auth gating + future per-user logging)
+    try:
+        audio_bytes = await audio.read()
+        if not audio_bytes:
+            return {"transcript": ""}
+
+        mime_type = audio.content_type or "audio/webm"
+
+        response = client.models.generate_content(
+            model=MODEL,
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
+                        types.Part(text=(
+                            "Transcribe the spoken audio exactly as spoken. "
+                            "Reply with ONLY the transcript text — no preamble, no quotes, "
+                            "no commentary. If no speech is detected, reply with an empty string."
+                        )),
+                    ],
+                )
+            ],
+            config=types.GenerateContentConfig(max_output_tokens=256),
+        )
+
+        transcript = (response.text or "").strip()
+        return {"transcript": transcript}
 
     except HTTPException:
         raise
