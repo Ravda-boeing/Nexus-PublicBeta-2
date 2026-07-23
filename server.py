@@ -1,10 +1,11 @@
 import os
 import uuid
+import mimetypes
 import traceback
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 
-from fastapi import FastAPI, HTTPException, Header, File, UploadFile
+from fastapi import FastAPI, HTTPException, Header, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -105,7 +106,143 @@ async def chat(request: MessageRequest, authorization: Optional[str] = Header(No
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ─── Voice Mode: Speech-to-Text ────────────────────────────────────────────
+# ─── File / image / PDF attachments ────────────────────────────────────────
+ALLOWED_ATTACHMENT_TYPES = {
+    "image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp",
+    "application/pdf",
+}
+MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024        # 8MB per file
+MAX_ATTACHMENTS_PER_MESSAGE = 4
+ATTACHMENTS_BUCKET = "nexus-attachments"       # must exist in Supabase Storage — see notes
+
+
+@app.post("/chat/upload")
+async def chat_upload(
+    message: str = Form(""),
+    session_id: Optional[str] = Form(None),
+    files: List[UploadFile] = File(...),
+    authorization: Optional[str] = Header(None),
+):
+    user_id = get_user_from_token(authorization)
+    try:
+        if len(files) > MAX_ATTACHMENTS_PER_MESSAGE:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Max {MAX_ATTACHMENTS_PER_MESSAGE} files per message",
+            )
+
+        session_id = session_id or str(uuid.uuid4())
+
+        if session_id not in active_sessions:
+            row = supabase.table("nexus_conversations") \
+                .select("messages") \
+                .eq("id", session_id) \
+                .eq("user_id", user_id) \
+                .execute()
+            active_sessions[session_id] = row.data[0]["messages"] if row.data else []
+
+        gemini_parts = []
+        stored_attachments = []
+
+        for f in files:
+            # Strip any ";charset=..." etc — same fix as the STT mime-type bug.
+            content_type = (f.content_type or "").split(";")[0].strip().lower()
+            if content_type not in ALLOWED_ATTACHMENT_TYPES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unsupported file type: {content_type or 'unknown'} ({f.filename})",
+                )
+
+            data = await f.read()
+            if not data:
+                continue
+            if len(data) > MAX_ATTACHMENT_BYTES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{f.filename} exceeds the 8MB limit",
+                )
+
+            # Persist to Supabase Storage so it's still viewable when the
+            # conversation is reloaded later (Gemini only sees it this turn).
+            ext = mimetypes.guess_extension(content_type) or ""
+            storage_path = f"{user_id}/{uuid.uuid4()}{ext}"
+            try:
+                supabase.storage.from_(ATTACHMENTS_BUCKET).upload(
+                    storage_path,
+                    data,
+                    {"content-type": content_type},
+                )
+            except Exception:
+                traceback.print_exc()
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        f"Failed to store {f.filename}. Make sure the "
+                        f"'{ATTACHMENTS_BUCKET}' bucket exists in Supabase Storage."
+                    ),
+                )
+
+            public_url = supabase.storage.from_(ATTACHMENTS_BUCKET).get_public_url(storage_path)
+            # Some supabase-py versions return {"publicUrl": "..."} instead of a bare string.
+            if isinstance(public_url, dict):
+                public_url = public_url.get("publicUrl") or public_url.get("public_url")
+
+            stored_attachments.append({
+                "url": public_url,
+                "mime_type": content_type,
+                "name": f.filename,
+            })
+
+            gemini_parts.append(types.Part.from_bytes(data=data, mime_type=content_type))
+
+        if message.strip():
+            gemini_parts.append(types.Part(text=message.strip()))
+        elif not gemini_parts:
+            raise HTTPException(status_code=400, detail="No message or files provided")
+
+        # History is replayed as text only — attachments from earlier turns
+        # are not re-uploaded to Gemini on later turns.
+        history = []
+        for msg in active_sessions[session_id]:
+            role = "model" if msg["role"] == "assistant" else "user"
+            history.append(types.Content(role=role, parts=[types.Part(text=msg.get("content") or "")]))
+
+        response = client.models.generate_content(
+            model=MODEL,
+            contents=history + [types.Content(role="user", parts=gemini_parts)],
+            config=types.GenerateContentConfig(
+                max_output_tokens=768,
+                system_instruction="You are Nexus, the AI for a browser based operating system named SinkOS. Be concise and helpful. Be enthusiastic where appropriate. there is to be NO markdowns, NO code blocks, NO lists, NO emojis, and NO formatting of any kind in your responses. Only plain text. Always respond in plain text. NEVER break character. Be honest with your answers, if you feel like there is no solid answer for the user's quiery, tell them that, they want an AI that's honest and sticks to Sink OS's values, not a lying machine. Treat the user with uptmost respect and kindness, they are your friend and you want to help them in any way you can, always try to talk in first person and be as human as possible."
+            )
+        )
+
+        reply = response.text
+        user_content = message.strip()
+
+        active_sessions[session_id].append({
+            "role": "user",
+            "content": user_content,
+            "attachments": stored_attachments,
+        })
+        active_sessions[session_id].append({"role": "assistant", "content": reply})
+
+        title_source = user_content or (stored_attachments[0]["name"] if stored_attachments else "Attachment")
+        title = title_source[:40] + "..." if len(title_source) > 40 else title_source
+        supabase.table("nexus_conversations").upsert({
+            "id": session_id,
+            "user_id": user_id,
+            "title": title,
+            "created_at": datetime.now().isoformat(),
+            "messages": active_sessions[session_id]
+        }).execute()
+
+        return {"reply": reply, "session_id": session_id, "attachments": stored_attachments}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 # Receives a recorded utterance (webm/opus from MediaRecorder) and transcribes
 # it via Gemini 2.5 Flash Lite. Auth-gated the same way as /chat. No audio is
 # ever persisted server-side — it's transcribed in-memory and discarded.
