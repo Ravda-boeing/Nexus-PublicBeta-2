@@ -114,10 +114,17 @@ async def voice_stt(audio: UploadFile = File(...), authorization: Optional[str] 
     user_id = get_user_from_token(authorization)  # noqa: F841 (kept for auth gating + future per-user logging)
     try:
         audio_bytes = await audio.read()
-        if not audio_bytes:
+        if not audio_bytes or len(audio_bytes) < 800:
+            # Too small to be a real utterance — don't waste a Gemini call on
+            # noise/silence, and don't risk it hallucinating a transcript.
             return {"transcript": ""}
 
-        mime_type = audio.content_type or "audio/webm"
+        # IMPORTANT: strip codec parameters (e.g. "audio/webm;codecs=opus" -> "audio/webm").
+        # Gemini's inline_data mime_type expects a bare MIME type; passing the
+        # codecs suffix through degrades or breaks audio parsing, which was
+        # causing confidently-wrong ("hallucinated") transcripts.
+        raw_mime = audio.content_type or "audio/webm"
+        mime_type = raw_mime.split(";")[0].strip()
 
         response = client.models.generate_content(
             model=MODEL,
@@ -127,14 +134,20 @@ async def voice_stt(audio: UploadFile = File(...), authorization: Optional[str] 
                     parts=[
                         types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
                         types.Part(text=(
-                            "Transcribe the spoken audio exactly as spoken. "
-                            "Reply with ONLY the transcript text — no preamble, no quotes, "
-                            "no commentary. If no speech is detected, reply with an empty string."
+                            "Transcribe ONLY the words actually spoken in this audio clip, exactly as spoken. "
+                            "Reply with ONLY the transcript text — no preamble, no quotes, no commentary, "
+                            "no translation, no correction of grammar. "
+                            "Do not guess, invent, or complete words you cannot clearly hear. "
+                            "If the audio is silent, contains no intelligible speech, or is too short/unclear "
+                            "to transcribe with confidence, reply with an empty string and nothing else."
                         )),
                     ],
                 )
             ],
-            config=types.GenerateContentConfig(max_output_tokens=256),
+            config=types.GenerateContentConfig(
+                max_output_tokens=256,
+                temperature=0.0,  # deterministic, minimizes creative "filling in" on weak audio
+            ),
         )
 
         transcript = (response.text or "").strip()
